@@ -1,0 +1,66 @@
+
+module Workflow.Vip where
+
+import DA.Set qualified as S (singleton)
+
+import Daml.Finance.Interface.Holding.Base qualified as Holding (I)
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as Instrument (qty)
+import Daml.Finance.Interface.Settlement.Factory qualified as SettlementF (I, Instruct(..))
+import Daml.Finance.Interface.Settlement.Batch qualified as Batch (I)
+import Daml.Finance.Interface.Settlement.Instruction qualified as Instruction (Allocate(..), Approve(..), I)
+import Daml.Finance.Interface.Settlement.Types (Allocation(Pledge), Approval(TakeDelivery), RoutedStep(..))
+import Daml.Finance.Interface.Types.Common.Types (AccountKey, Id(..), InstrumentKey(..))
+
+
+template VipRequest with
+    depository: Party
+    issuer: Party
+    requestor: Party
+    deliveryAcc: AccountKey
+    settlementFactoryCid: ContractId SettlementF.I
+    vipTokenVersion: Text
+  where
+    signatory requestor
+    observer issuer
+    choice Accept: (ContractId Batch.I, ContractId Instruction.I) with
+    -- choice Accept: (ContractId Batch.I, ContractId Instruction.I, ContractId Instruction.I) with
+        -- vipHolding: ContractId Transferable.I
+        vipHolding: ContractId Holding.I
+        custodian: Party
+      controller issuer
+      do
+        let usdt = InstrumentKey with depository, issuer, version = "0", id = Id "USDT"
+            vipToken = InstrumentKey with depository, issuer, version = vipTokenVersion, id = Id "VIP"
+        (batch, [i, i']) <- exercise settlementFactoryCid SettlementF.Instruct with
+            instructors = S.singleton requestor
+            settlers = S.singleton requestor
+            id = Id "bank settlement" -- Factory identifier.
+            contextId = None -- Identifier to link a batch to a context (eg. the Effect it originated from).
+            settlementTime = None
+            routedSteps =
+                [ RoutedStep with
+                    sender = requestor
+                    receiver = issuer
+                    custodian
+                    quantity = Instrument.qty 1000.0 usdt
+                , RoutedStep with
+                    sender = issuer
+                    receiver = requestor
+                    custodian
+                    quantity = Instrument.qty 1.0 vipToken
+                ]
+            description = ""
+
+        -- auto allocation and approval of token transfer
+        (allocated, _) <- exercise i' Instruction.Allocate with
+            allocation = Pledge vipHolding
+            actors = S.singleton issuer
+        exercise allocated Instruction.Approve with
+            approval = TakeDelivery deliveryAcc
+            actors = S.singleton requestor
+            
+        -- return batch settement and inst for payment to be allocated by requestor
+        pure (batch, i)
+    choice Decline: ()
+      controller issuer
+      do pure ()

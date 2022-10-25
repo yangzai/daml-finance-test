@@ -1,0 +1,214 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE DerivingVia #-}
+
+module Variance
+    ( widen
+    , narrow
+    , rwiden
+    , lnarrow
+    , fwiden
+    , swiden
+    , biwiden
+    , widenCid
+    , biwidenCid
+    ) where
+
+import DA.Text qualified as T (length)
+import Daml.Data.Functor.Contravariant (Contravariant(..))
+import Daml.Data.Profunctor (Profunctor(..), dimap, lmap, rmap)
+import Daml.Script
+import DA.Bifunctor (Bifunctor(..), first, second)
+import DA.Action.State (State(..))
+
+
+-- https://typelevel.org/blog/2016/02/04/variance-and-functors.html
+-- https://www.benjamin.pizza/posts/2019-01-11-the-fourth-type-of-variance.html 
+data EmptyView = EmptyView {}
+data AnimalView = AnimalView { owner: Party, colour: Text, typ: Text }
+    deriving Show
+
+--    Animal
+--   /      \
+-- Bird    Mammal
+--  |      /    \
+-- Pigeon Cat   Dog
+interface Animal where
+  viewtype AnimalView
+  showAnimal: Text
+  sound: Text
+  changeOwner: Party -> Update (ContractId Animal)
+  choice ChangeOwner: ContractId Animal with
+      newOwner: Party
+    controller newOwner
+    do changeOwner this newOwner
+interface Mammal requires Animal where
+  viewtype EmptyView
+interface Bird requires Animal where
+  viewtype EmptyView
+template Dog with
+    owner: Party
+    colour: Text
+  where
+    signatory owner
+    ensure False
+    interface instance Animal for Dog where
+      view = AnimalView owner colour (showAnimal $ toInterface this)
+      showAnimal = "Dog"
+      sound = "woof"
+      changeOwner newOwner = toInterfaceContractId <$> create this with owner = newOwner
+    interface instance Mammal for Dog where
+      view = EmptyView {}
+
+template Cat with
+    owner: Party
+    colour: Text
+  where
+    signatory owner
+    ensure colour /= colour
+    interface instance Animal for Cat where
+      view = AnimalView owner colour (showAnimal $ toInterface this)
+      showAnimal = "Cat"
+      sound = "meow"
+      changeOwner newOwner = toInterfaceContractId <$> create this with owner = newOwner
+    interface instance Mammal for Cat where
+      view = EmptyView {}
+template Pigeon with
+    owner: Party
+    colour: Text
+  where
+    signatory owner
+    interface instance Animal for Pigeon where
+      view = AnimalView owner colour (showAnimal $ toInterface this)
+      showAnimal = "Pigeon"
+      sound = "coo"
+      changeOwner newOwner = toInterfaceContractId <$> create this with owner = newOwner
+    interface instance Bird for Pigeon where
+      view = EmptyView {}
+
+-- newtype Flip p a b = Flip { unFlip : p b a }
+-- instance Contravariant (Flip (->) a) where
+--     contramap f (Flip uf) = Flip $ uf . f
+newtype Encoder a = Encoder { encode: a -> Text } --deriving Contravariant via (Flip (->) Text)
+instance Contravariant Encoder where
+    contramap f (Encoder e) = Encoder $ e . f
+
+--    Food
+--      |
+--    Fruit
+--   /     \
+-- Apple Orange
+interface Food where
+  viewtype EmptyView
+  showFood: Text
+interface Fruit requires Food where
+  viewtype EmptyView
+template Apple with
+    owner: Party
+  where
+    signatory owner
+    interface instance Food for Apple where
+      view = EmptyView {}
+      showFood = "Apple"
+    interface instance Fruit for Apple where
+      view = EmptyView {}
+template Orange with
+    owner: Party
+  where
+    signatory owner
+    interface instance Food for Orange where
+      view = EmptyView {}
+      showFood = "Orange"
+    interface instance Fruit for Orange where
+      view = EmptyView {}
+
+-- fmap     : (a -> b) -> f a -> f b                    -- (covariant) functor
+-- contramap: (b -> a) -> f a -> f b                    -- contravariant functor
+-- dimap    : (a -> b) -> (c -> d) -> p b c -> p a d    -- profunctor
+-- invmap   : (a -> b) -> (b -> a) -> f a -> f b        -- invariant functor
+widen : forall super a f. (Functor f, HasToInterface a super) => f a -> f super
+widen = fmap toInterface
+
+narrow : forall sub a f. (Contravariant f, HasToInterface sub a) => f a -> f sub
+narrow = contramap toInterface
+
+rwiden : forall super a x f. (Profunctor f, HasToInterface a super) => f x a -> f x super
+rwiden = rmap toInterface
+
+lnarrow : forall sub a x f. (Profunctor f, HasToInterface sub a) => f a x -> f sub x
+lnarrow = lmap toInterface
+
+fwiden : forall super a x f. (Bifunctor f, HasToInterface a super) => f a x -> f super x
+fwiden = first toInterface
+
+swiden : forall super a x f. (Bifunctor f, HasToInterface a super) => f x a -> f x super
+swiden = second toInterface
+
+biwiden : forall supera superb a b f. (Bifunctor f, HasToInterface a supera, HasToInterface b superb) => f a b -> f supera superb
+biwiden = bimap toInterface toInterface
+
+widenCid : forall super a f. (Functor f, HasToInterface a super) => f (ContractId a) -> f (ContractId super)
+widenCid = fmap toInterfaceContractId
+
+biwidenCid : forall supera superb a b f. (Bifunctor f, HasToInterface a supera, HasToInterface b superb) => f (ContractId a) (ContractId b) -> f (ContractId supera) (ContractId superb)
+biwidenCid = bimap toInterfaceContractId toInterfaceContractId
+
+data Proxy a = Proxy ()
+
+main = do
+    public <- allocatePartyWithHint <*> PartyIdHint $ "public"
+    debug public
+    debug =<< listKnownParties
+    
+    let dog = Dog public "brown"
+        dog' = Dog public "black"
+        cat = Cat public "orange"
+        cat' = Cat public "black"
+        pigeon = Pigeon public "grey"
+        apple = Apple public
+        orange = Orange public
+
+        -- covariance
+        -- List[+A]
+        -- val dogs: List[Dog] = ???
+        -- val cats: List[Cat] = ???
+        -- val animals: List[Animal] = dogs ++ cats
+        dogs: [Dog] = [dog, dog']
+        cats: [Cat] = [cat, cat']
+        animals: [Animal] = fmap toInterface dogs ++ fmap toInterface cats
+        animals': [Animal] = widen dogs ++ widen cats
+        animals'' = widen @Animal dogs ++ widen cats
+        ds: Optional [Dog] = mapA fromInterface animals
+
+        -- contravariance
+        -- Encoder[-A]
+        -- val animalEncoder: Encoder[Animal] = ???
+        -- val dogEncoder: Encoder[Dog] = animalEncoder
+        animalEncoder: Encoder Animal = Encoder $ show . view
+        dogEncoder: Encoder Dog = Encoder $ animalEncoder.encode . toInterface
+        dogEncoder': Encoder Dog = contramap toInterface animalEncoder
+        dogEncoder'': Encoder Dog = narrow animalEncoder
+        dogEncoder''' = narrow @Dog animalEncoder
+
+        -- profunctors
+        -- -A => +B
+        -- val animalsToFruits: Animal => Fruit = ???
+        -- val mammalsToFood: Mammal => Food = animalsToFruits
+        animalsToFruits: Animal -> Fruit = f . showAnimal
+          where
+            f = \case
+              "Cat" -> toInterface apple
+              "Dog" -> toInterface orange
+              "Pigeon" -> toInterface apple
+              _ -> toInterface orange
+        mammalsToFood: Mammal -> Food = toInterface . animalsToFruits . toInterface
+        mammalsToFood': Mammal -> Food = dimap toInterface toInterface animalsToFruits
+        mammalsToFood'': Mammal -> Food = rwiden . lnarrow $ animalsToFruits
+        mammalsToFood''' = rwiden @Food . lnarrow @Mammal $ animalsToFruits
+        dogState = State
+    debug $ show dog
+    debug $ show cat
+    debug $ dogEncoder'''.encode dog
+    debug $ showFood $ mammalsToFood''' $ toInterface dog
+    debug $ showFood $ lnarrow @Dog mammalsToFood''' $ dog
+    listKnownParties >>= debug
+    pure ()

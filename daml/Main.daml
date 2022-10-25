@@ -1,0 +1,367 @@
+module Main where
+
+import DA.Map qualified as M
+import DA.Set qualified as S
+import ContingentClaims.Core.Claim qualified as CC ((<=))
+import ContingentClaims.Core.Observation qualified as O
+import Workflow.Vip qualified as Vip (Accept(..))
+
+import Daml.Finance.Interface.Account.Account qualified as Account (I, Controllers(..))
+import Daml.Finance.Interface.Account.Factory qualified as Account (F,  Create(..))
+-- import Daml.Finance.Interface.Data.Reference.Time qualified as Time (I,Advance(..))
+import Fixes.Time qualified as Time (I,Advance(..))
+import Daml.Finance.Interface.Holding.Factory qualified as Holding (F, Create(..))
+import Daml.Finance.Interface.Holding.Base qualified as Holding (I, GetView(..))
+import Daml.Finance.Interface.Holding.Fungible qualified as Fungible (Split(..), SplitResult(..), I)
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as Instrument (I)
+import Daml.Finance.Interface.Instrument.Token.Factory qualified as Token (F, Create(..))
+import Daml.Finance.Interface.Instrument.Generic.Factory qualified as Generic (F, Create(..), Remove(..))
+import Daml.Finance.Interface.Lifecycle.Rule.Lifecycle qualified as Lifecycle (I, Evolve(..))
+import Daml.Finance.Interface.Lifecycle.Rule.Claim qualified as LifecycleClaim (I, ClaimEffect(..), ClaimResult(..))
+import Daml.Finance.Interface.Settlement.Batch qualified as Batch (Settle(..))
+import Daml.Finance.Interface.Settlement.Factory qualified as SettlementF (I)
+import Daml.Finance.Interface.Settlement.Instruction qualified as Instruction (Allocate(..), Approve(..))
+
+import Daml.Finance.Account.Account qualified as Account (Factory(..))
+-- import Daml.Finance.Data.Time.DateClock qualified as DateClock (DateClock(..))
+import Fixes.DateClock qualified as DateClock (DateClock(..))
+import Daml.Finance.Holding.Fungible qualified as Fungible (Factory(..))
+-- import Daml.Finance.Holding.NonFungible qualified as NonFungible (Factory(..))
+import Daml.Finance.Instrument.Token.Factory qualified as Token (Factory(..))
+import Daml.Finance.Instrument.Generic.Factory qualified as Generic (Factory(..))
+import Daml.Finance.Instrument.Generic.Instrument qualified as Generic (Instrument(..))
+import Daml.Finance.Instrument.Generic.Lifecycle.Rule qualified as LifecycleGeneric (Rule(..))
+import Daml.Finance.Lifecycle.Rule.Claim qualified as LifecycleClaim (Rule(..))
+import Daml.Finance.Settlement.Factory qualified as Settlement (Factory(..))
+
+
+import Prelude hiding (or, and)
+import Daml.Script
+import DA.Time (days, addRelTime)
+import DA.Date (toDateUTC)
+import DA.Foldable (forA_)
+import Variance (widenCid)
+import Workflow.Vip (VipRequest(..))
+import ContingentClaims.Core.Claim (until, anytime, cond, at, give, when, upTo, zero, scale, one, or, and)
+
+import Daml.Finance.Interface.Instrument.Token.Types (Token(..))
+import Daml.Finance.Interface.Types.Common.Types (AccountKey(..), Id(..), InstrumentKey(..))
+import Daml.Finance.Interface.Settlement.Types (Allocation(Pledge), Approval(TakeDelivery))
+
+import Daml.Finance.Data.Time.DateClock.Types (Unit(..))
+import Daml.Finance.Data.Numeric.Observation (Observation(..))
+import Daml.Finance.Settlement.RouteProvider.SingleCustodian (SingleCustodian(..))
+
+
+setup : Script ()
+setup = script do
+    alice <- allocatePartyWithSameHint "Alice"
+    bank <- allocatePartyWithSameHint "Bank"
+
+    --setup factories for account, holding, instruments
+    afCid <- submit bank
+        . widenCid @Account.F -- fmap (toInterfaceContractId @Account.F)
+        $ createCmd Account.Factory with
+            provider = bank
+            observers = mempty
+    ffCid <- submit bank
+        . widenCid @Holding.F
+        $ createCmd Fungible.Factory with
+            provider = bank
+            observers = mempty
+    nffCid <- submit bank
+        . widenCid @Holding.F
+        -- $ createCmd NonFungible.Factory with -- settlements does not seem to work when the allocated holdings are of different types.
+        $ createCmd Fungible.Factory with
+            provider = bank
+            observers = mempty
+    tfCid <- submit bank
+        . widenCid @Token.F
+        $ createCmd Token.Factory with
+            provider = bank
+            observers = mempty
+    gfCid <- submit bank
+        . widenCid @Generic.F
+        $ createCmd Generic.Factory with
+            provider = bank
+            observers = mempty
+
+    let aliceAccKey = AccountKey bank alice (Id "alice")
+        bankAccKey = AccountKey bank bank (Id "bank")
+        vipToken = InstrumentKey with depository = bank, issuer = bank, id = Id "VIP", version = "0"
+        usdt = InstrumentKey with depository = bank, issuer = bank, id = Id "USDT", version = "0"
+
+    -- setup instruments, accounts, initial holdings, settlement factory
+    -- note: holding takes instrument key and everything will still work fine even if instrument was not created
+    now <- getTime
+    usdtCid <- submit bank
+        -- . widenCid @Instrument.I
+        $ exerciseCmd tfCid Token.Create with
+            token = Token with
+                instrument = usdt
+                description = ""
+                validAsOf = now
+            observers = mempty
+    viptCid <- submit bank
+        -- . widenCid @Instrument.I
+        $ exerciseCmd gfCid Generic.Create with
+            instrument = vipToken
+            description = ""
+            claims = zero
+            acquisitionTime = now
+            lastEventTimestamp = now
+            observers = mempty
+
+    aliceAcc <- submitMulti [alice, bank] []
+        -- . widenCid @Account.I
+        $ exerciseCmd afCid Account.Create with
+            account = aliceAccKey
+            holdingFactoryCid = nffCid
+            controllers = Account.Controllers with
+                incoming = S.singleton alice
+                outgoing = S.singleton alice
+                -- instructors = S.singleton alice
+                -- approvers = S.singleton alice
+            description = "xxxx"
+            observers = mempty
+    bankAcc <- submit bank
+        -- . widenCid @Account.I
+        $ exerciseCmd afCid Account.Create with
+            account = bankAccKey
+            holdingFactoryCid = nffCid
+            controllers = Account.Controllers with
+                incoming = S.singleton bank
+                outgoing = S.singleton bank
+                -- instructors = S.singleton bank
+                -- approvers = S.singleton bank
+            description = "xxxx"
+            observers = mempty
+    
+    usdtHolding <- submitMulti [alice, bank] []
+        . widenCid @Holding.I
+        $ exerciseCmd ffCid Holding.Create with
+            instrument = usdt
+            account = aliceAccKey
+            amount = 1100.0
+            observers = mempty
+    vipHolding <- submit bank
+        -- . widenCid @Holding.I
+        $ exerciseCmd ffCid Holding.Create with
+            instrument = vipToken
+            account = bankAccKey
+            amount = 1.0
+            observers = mempty
+    settlementFactoryCid <- submit bank
+        . widenCid @SettlementF.I
+        $ createCmd Settlement.Factory with
+            provider = bank
+            observers = mempty
+
+    -- DvP request-accept for VIP token purchase
+    vipReqCid <- submit alice
+        $ createCmd VipRequest with
+            depository = bank
+            issuer = bank
+            requestor = alice
+            deliveryAcc = aliceAccKey
+            settlementFactoryCid
+            vipTokenVersion = vipToken.version
+    (batchInstCid, usdtSettleInstCid) <- submit bank
+        $ exerciseCmd vipReqCid Vip.Accept with
+            vipHolding
+            custodian = bank
+
+    -- spit USDT holdings - 1000 for VIP, remainder 100 for event
+    Fungible.SplitResult {splitCids=[usdtHolding, usdtHolding'], rest=None} <- submit alice
+        $ exerciseCmd (coerceContractId @Holding.I @Fungible.I usdtHolding) Fungible.Split with
+            amounts = [1000.0, 100.0]
+
+    -- allocate and approve payment
+    (allocated, _) <- submit alice $ exerciseCmd usdtSettleInstCid Instruction.Allocate with
+        allocation = Pledge $ coerceContractId usdtHolding
+        actors = S.singleton alice
+    submit bank $ exerciseCmd allocated Instruction.Approve with
+        approval = TakeDelivery bankAccKey
+        actors = S.singleton bank
+    
+    -- settlement
+    [usdtHolding, vipHolding] <- submitMulti [bank, alice] []
+        $ exerciseCmd batchInstCid Batch.Settle with
+            actors = S.fromList [bank, alice]
+
+    ---
+
+    -- new event - VIPs are given the potion to purchase the ticket for the event
+    let tixKey = InstrumentKey with
+            id = Id "event 1"
+            depository = bank
+            issuer = bank
+            version = "0"
+        eventTime = now `addRelTime` days 30
+        vipExpiry = now `addRelTime` days 9999
+        paymentClaim = give $ scale (O.pure 100.0) $ one usdt
+
+        -- not needed for generic - auto bump to next version with hash
+        -- swapClaim = give (one vipToken) `and` (one vipToken with version = "1")
+
+        exercisedClaim = paymentClaim `and` one tixKey
+        tixClaim = mconcat
+            [ when (upTo eventTime) $ condNonNeg (O.observe "exercise") exercisedClaim zero
+
+            -- we need a claim that does not happen so that there will be remaining claims
+            -- remaining claims triggers the version upgrade of generic instrument during lifecycling
+            -- otherwise we could also do it manually
+            , when (at vipExpiry) $ one usdt
+            ]
+        -- tixClaim = exercisedClaim `or` zero
+        
+    -- Generic instrument supports custom contingent claims.
+    -- The Generic instrument interface requires the Claim interface
+    -- which supports effectful claims (getClaims : GetClaims -> Update [TaggedClaim]).
+    -- However the default implemention fixes the effect to a pure value
+    -- (getClaims _ = pure [TaggedClaim with tag = "Generic"; claim = this.claims]).
+  
+    -- For claims to be dynamically added we either have to reimplement a custom Generic instrument
+    -- or workarond the default implemation by manually consuming the instrument
+    -- which might not be safe because instruments are generally not expected to be consuming.
+    Some (vipTokenInst) <- queryContractId @Generic.Instrument bank $ fromInterfaceContractId viptCid
+    
+    submit bank
+        . exerciseCmd gfCid
+        $ Generic.Remove vipToken
+
+    viptCid <- submit bank
+        -- . widenCid @Instrument.I
+        $ exerciseCmd gfCid Generic.Create with
+            instrument = vipToken
+            description = vipTokenInst.description
+            claims = tixClaim <> vipTokenInst.claims
+            -- claims = tixClaim
+            acquisitionTime = vipTokenInst.acquisitionTime
+            lastEventTimestamp = vipTokenInst.lastEventTimestamp
+            observers = vipTokenInst.observers
+
+    dateClock <- submit bank
+        .widenCid @Time.I
+        $ createCmd DateClock.DateClock with
+            providers = S.singleton bank
+            date = Unit $ toDateUTC (now `addRelTime` days 10)
+            id = Id "CLOCK"
+            description = ""
+            observers = mempty
+    (dateClock, event) <- submit bank $ exerciseCmd dateClock Time.Advance with
+        eventId = Id "Alice exercise"
+        eventDescription = "Alice exercise date"
+
+    -- observable to indicate the exercise of the option
+    oExercise <- submit bank
+        . widenCid
+        $ createCmd Observation with
+            provider = bank
+            id = Id "exercise"
+            -- observations = M.fromList [(time (toDateUTC $ now `addRelTime` days 10) 12 00 00, 1.0)]
+            observations = M.fromList [(now, 1.0)]
+            observers = mempty
+
+    -- lifcycling specicfic contracts
+    lifecycleRuleCid <- submit bank
+        . widenCid @Lifecycle.I
+        $ createCmd LifecycleGeneric.Rule with
+            providers = S.singleton bank
+            observers = M.empty
+            lifecycler = bank
+            id = Id "LifecycleRule"
+            description = "Rule to lifecycle a generic instrument"
+    routeProviderCid <- submit alice
+        . widenCid
+        $ createCmd SingleCustodian with
+            provider = alice
+            custodian = bank
+            observers = S.empty
+    lifecycleRuleClaimCid <- submit bank
+        . widenCid @LifecycleClaim.I
+        $ createCmd LifecycleClaim.Rule with
+            providers = S.singleton bank
+            claimers = S.fromList [bank, alice]
+            settlers = S.fromList [bank, alice]
+            routeProviderCid
+            settlementFactoryCid
+            netInstructions = False
+
+    -- run lifecycle
+    (Some newVipToken, effects@[effect]) <- submit bank $ exerciseCmd @Lifecycle.I lifecycleRuleCid Lifecycle.Evolve with
+        -- settlers = S.singleton bank
+        -- ruleName = "Time" -- this has to be Time
+        -- timeObservableCid = toInterfaceContractId dateClock -- this is being ignored by `processClockUpdate`
+        eventCid = toInterfaceContractId event
+        observableCids = [oExercise]
+        instrument = vipToken
+
+    -- claim effect
+    result@LifecycleClaim.ClaimResult{batchCid, instructionCids=[giveVipInst, giveUsdtInst, getNewVipInst, getTixInst]} <- submitMulti [alice, bank] [] $
+        -- exerciseCmd (fromInterfaceContractId @Lifecycle.I viptCid) LifecycleClaim.ClaimEffect with
+        exerciseCmd lifecycleRuleClaimCid LifecycleClaim.ClaimEffect with
+            claimer = alice
+            holdingCids = [vipHolding]
+            effectCid = effect
+            batchId = Id "DistributionSettlement"
+    
+    -- create holdings for event ticket and new (re-versioned from lifecycling) for settlement
+    tixHolding <- submit bank $ exerciseCmd nffCid Holding.Create with
+        instrument = tixKey
+        account = bankAccKey
+        amount = 1.0
+        observers = mempty
+    newVipHolding <- submit bank $ exerciseCmd nffCid Holding.Create with
+        instrument = newVipToken
+        account = bankAccKey
+        amount = 1.0
+        observers = mempty
+
+    -- settle give instructions
+    (allocated, _) <- submit alice $ exerciseCmd giveVipInst Instruction.Allocate with
+        allocation = Pledge vipHolding
+        actors = S.singleton alice
+    submit bank $ exerciseCmd allocated Instruction.Approve with
+        approval = TakeDelivery bankAccKey
+        actors = S.singleton bank
+
+    (allocated, _) <- submit alice $ exerciseCmd giveUsdtInst Instruction.Allocate with
+        allocation = Pledge $ toInterfaceContractId usdtHolding'
+        actors = S.singleton alice
+    submit bank $ exerciseCmd allocated Instruction.Approve with
+        approval = TakeDelivery bankAccKey
+        actors = S.singleton bank
+    
+    -- settle get instructions
+    (allocated, _) <- submit bank $ exerciseCmd getNewVipInst Instruction.Allocate with
+        allocation = Pledge newVipHolding
+        actors = S.singleton bank
+    submit alice $ exerciseCmd allocated Instruction.Approve with
+        approval = TakeDelivery aliceAccKey
+        actors = S.singleton alice
+
+    (allocated, _) <- submit bank $ exerciseCmd getTixInst Instruction.Allocate with
+        allocation = Pledge tixHolding
+        actors = S.singleton bank
+    submit alice $ exerciseCmd allocated Instruction.Approve with
+        approval = TakeDelivery aliceAccKey
+        actors = S.singleton alice
+
+    -- run batch
+    holdings <- submitMulti [bank, alice] []
+        $ exerciseCmd batchCid Batch.Settle with
+            actors = S.fromList [bank, alice]
+
+    holdingViews <- submitMulti [bank, alice] []
+        . forA holdings
+        $ flip exerciseCmd Holding.GetView with viewer = bank
+    forA_ holdingViews debug
+  where
+    allocatePartyWithSameHint = allocatePartyWithHint <*> PartyIdHint
+
+    z = O.pure aunit
+    condEq o o' c = cond (o CC.<= o') <*> cond (o' CC.<= o) c
+    condNonNeg o = flip . cond $ o CC.<= z
+    condNonPos o = flip . cond $ z CC.<= o
+    

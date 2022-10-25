@@ -1,0 +1,11 @@
+module Try where
+
+import DA.Exception (HasFromAnyException, ActionCatch, _tryCatch)
+
+
+_t : (ActionCatch m, HasFromAnyException a) => m b -> m (Either a b)
+_t mb = try fmap Right mb catch e -> pure $ Left e
+
+-- _try : ActionCatch (m a) => (() -> Either AnyException b) -> Either a (Either AnyException b)
+_try : ActionCatch m => m b -> m (Either AnyException b)
+_try mb = _tryCatch (const $ fmap Right mb) (Some . pure . Left)

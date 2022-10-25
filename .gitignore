@@ -1,0 +1,5 @@
+/.daml
+/.lib
+/log
+navigator.log
+.DS_Store
